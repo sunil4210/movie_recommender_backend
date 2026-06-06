@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, DateTime, ForeignKey,
-    UniqueConstraint, CheckConstraint, Text
+    UniqueConstraint, CheckConstraint, Text, Boolean
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -31,7 +31,21 @@ class User(Base):
     last_name = Column(String(100), nullable=True)
     age = Column(Integer, nullable=True)
     gender = Column(String(10), nullable=True)
+    email_verified = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OtpCode(Base):
+    __tablename__ = "otp_codes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(100), nullable=False, index=True)
+    code_hash = Column(String(255), nullable=False)
+    purpose = Column(String(20), nullable=False)  # 'signup' | 'reset'
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    consumed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Movie(Base):
@@ -46,6 +60,14 @@ class Movie(Base):
     # 4x3-component BlurHash string (~30 chars) computed offline from poster image.
     # Rendered client-side as a low-cost placeholder while the full poster loads.
     blur_hash = Column(String(64), nullable=True)
+    # TMDB id for the movie. Populated lazily by the TMDB integration so we
+    # can hit `/movie/{tmdb_id}/videos` directly when fetching trailers.
+    tmdb_id = Column(Integer, nullable=True, index=True)
+    # YouTube video key for the official trailer, cached after first lookup.
+    # `""` means "we looked and there's none" so we don't re-query TMDB.
+    trailer_key = Column(String(32), nullable=True)
+    # Plot/synopsis text from TMDB, captured at the same time as poster_url.
+    overview = Column(Text, nullable=True)
 
 
 class Rating(Base):
@@ -55,6 +77,7 @@ class Rating(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     movie_id = Column(Integer, ForeignKey("movies.id"), nullable=False, index=True)
     rating = Column(Float, nullable=False)
+    comment = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -106,6 +129,59 @@ def init_db():
     """Create all tables and apply any lightweight column migrations."""
     Base.metadata.create_all(bind=engine)
     _ensure_movie_blur_hash_column()
+    _ensure_rating_comment_column()
+    _ensure_user_email_verified_column()
+    _ensure_movie_trailer_columns()
+    _ensure_movie_overview_column()
+
+
+def _ensure_movie_trailer_columns() -> None:
+    """Add movies.tmdb_id + movies.trailer_key on legacy SQLite DBs."""
+    from sqlalchemy import text, inspect
+
+    inspector = inspect(engine)
+    if "movies" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("movies")}
+    with engine.begin() as conn:
+        if "tmdb_id" not in cols:
+            conn.execute(text("ALTER TABLE movies ADD COLUMN tmdb_id INTEGER"))
+        if "trailer_key" not in cols:
+            conn.execute(text("ALTER TABLE movies ADD COLUMN trailer_key VARCHAR(32)"))
+
+
+def _ensure_movie_overview_column() -> None:
+    """Add movies.overview column on legacy SQLite DBs without a migration tool."""
+    from sqlalchemy import text, inspect
+
+    inspector = inspect(engine)
+    if "movies" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("movies")}
+    if "overview" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE movies ADD COLUMN overview TEXT"))
+
+
+def _ensure_user_email_verified_column() -> None:
+    """Add users.email_verified column on legacy SQLite DBs without a migration tool.
+
+    Existing rows (incl. MovieLens placeholder users) are backfilled to 1 (verified)
+    so they keep behaving as before — only NEW signups must verify.
+    """
+    from sqlalchemy import text, inspect
+
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    if "email_verified" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE users ADD COLUMN email_verified BOOLEAN NOT NULL DEFAULT 1"
+        ))
 
 
 def _ensure_movie_blur_hash_column() -> None:
@@ -120,6 +196,20 @@ def _ensure_movie_blur_hash_column() -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE movies ADD COLUMN blur_hash VARCHAR(64)"))
+
+
+def _ensure_rating_comment_column() -> None:
+    """Add ratings.comment column on legacy SQLite DBs without a migration tool."""
+    from sqlalchemy import text, inspect
+
+    inspector = inspect(engine)
+    if "ratings" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("ratings")}
+    if "comment" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ratings ADD COLUMN comment TEXT"))
 
 
 def load_movielens_data():

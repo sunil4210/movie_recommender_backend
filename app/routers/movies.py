@@ -2,12 +2,14 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.database import get_db, Movie
-from app.models import MovieResponse, MovieListResponse
+from app.auth import require_auth
+from app.database import get_db, Movie, User
+from app.models import MovieResponse, MovieListResponse, TrailerResponse
 from app.services.movie_service import (
-    get_movie_with_stats, search_movies, get_popular_movies, get_trending_movies
+    get_movie_with_stats, search_movies, get_popular_movies, get_trending_movies,
+    get_trailer_key,
 )
-from app.utils.tmdb import populate_poster_urls
+from app.utils.tmdb import populate_poster_urls, backfill_overviews
 
 router = APIRouter(prefix="/movies", tags=["Movies"])
 
@@ -67,9 +69,30 @@ def trending(
 
 
 @router.post("/populate-posters")
-def populate_posters(db: Session = Depends(get_db)):
-    """Fetch and store poster URLs from TMDB for all movies missing one."""
+def populate_posters(
+    current_user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Fetch and store poster URLs from TMDB for all movies missing one.
+
+    Auth-gated: each call iterates the whole catalog with TMDB lookups and
+    would burn our API quota if exposed anonymously.
+    """
     count = populate_poster_urls(db, Movie)
+    return {"updated": count}
+
+
+@router.post("/backfill-overviews")
+def backfill_overviews_route(
+    current_user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Fill `overview` for movies that already have a poster but no synopsis.
+
+    Cheap, idempotent — only hits TMDB for rows where overview IS NULL.
+    Same auth rationale as `populate-posters`.
+    """
+    count = backfill_overviews(db, Movie)
     return {"updated": count}
 
 
@@ -80,3 +103,23 @@ def get_movie(movie_id: int, db: Session = Depends(get_db)):
     if not movie:
         raise HTTPException(status_code=404, detail="Movie not found")
     return MovieResponse(**get_movie_with_stats(movie, db))
+
+
+@router.get("/{movie_id}/trailer", response_model=TrailerResponse)
+def get_trailer(movie_id: int, db: Session = Depends(get_db)):
+    """Return the official YouTube trailer for a movie.
+
+    Resolves the TMDB id lazily on first call, then caches the result so
+    repeated requests skip TMDB entirely. Returns 404 when no trailer is
+    available."""
+    if not db.query(Movie).filter(Movie.id == movie_id).first():
+        raise HTTPException(status_code=404, detail="Movie not found")
+
+    key = get_trailer_key(db, movie_id)
+    if not key:
+        raise HTTPException(status_code=404, detail="No trailer available for this movie")
+
+    return TrailerResponse(
+        youtube_key=key,
+        embed_url=f"https://www.youtube.com/embed/{key}",
+    )

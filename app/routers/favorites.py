@@ -15,9 +15,9 @@ def get_user_favorites(
     current_user: User = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
+    """Get user's favorite movies."""
     if current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Cannot view other user's favorites")
-    """Get user's favorite movies."""
     favorites = db.query(Favorite).filter(Favorite.user_id == user_id).all()
     results = []
     for fav in favorites:
@@ -97,9 +97,9 @@ def remove_favorite(
     current_user: User = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
+    """Remove movie from favorites."""
     if current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Cannot remove other user's favorites")
-    """Remove movie from favorites."""
     fav = (
         db.query(Favorite)
         .filter(Favorite.user_id == user_id, Favorite.movie_id == movie_id)
