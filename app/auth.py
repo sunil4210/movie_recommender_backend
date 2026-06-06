@@ -38,8 +38,14 @@ def get_current_user(
         return None
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
-        if user_id is None:
+        raw_sub = payload.get("sub")
+        if raw_sub is None:
+            return None
+        # JWT `sub` is issued as str (RFC 7519); cast back so the User.id
+        # comparison stays an int even on strict-typed backends (e.g. Postgres).
+        try:
+            user_id = int(raw_sub)
+        except (TypeError, ValueError):
             return None
         user = db.query(User).filter(User.id == user_id).first()
         return user
@@ -48,7 +54,7 @@ def get_current_user(
 
 
 def require_auth(
-    token: str = Depends(oauth2_scheme),
+    token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> User:
     """Require authenticated user. Raises 401 if not authenticated."""
@@ -56,10 +62,14 @@ def require_auth(
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
+        raw_sub = payload.get("sub")
+        if raw_sub is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        user = db.query(User).filter(User.id == int(user_id)).first()
+        try:
+            user_id = int(raw_sub)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = db.query(User).filter(User.id == user_id).first()
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         return user

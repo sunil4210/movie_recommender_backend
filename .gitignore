@@ -40,3 +40,5 @@ htmlcov/
 
 # Dataset (large files)
 data/ml-100k.zip
+assets/env
+assets/env

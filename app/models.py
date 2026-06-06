@@ -36,6 +36,46 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
+# --- OTP Models ---
+
+class SignupResponse(BaseModel):
+    """Returned by /auth/signup. The account exists but is unverified — the
+    client should route to the OTP verify screen with this email."""
+
+    email: EmailStr
+    email_verified: bool = False
+    message: str = "Verification code sent. Check your inbox."
+
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    code: str
+
+
+class ResendOtpRequest(BaseModel):
+    email: EmailStr
+    purpose: str  # 'signup' | 'reset'
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+
+class GenericMessage(BaseModel):
+    message: str
+
+
+class TrailerResponse(BaseModel):
+    youtube_key: str
+    embed_url: str
+
+
 class UserResponse(BaseModel):
     id: int
     email: str
@@ -62,6 +102,7 @@ class MovieResponse(BaseModel):
     total_ratings: int = 0
     poster_url: Optional[str] = None
     blur_hash: Optional[str] = None
+    overview: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -80,10 +121,12 @@ class RatingCreate(BaseModel):
     user_id: int
     movie_id: int
     rating: float  # 1.0 to 5.0
+    comment: Optional[str] = None
 
 
 class RatingUpdate(BaseModel):
     rating: float
+    comment: Optional[str] = None
 
 
 class RatingResponse(BaseModel):
@@ -92,6 +135,20 @@ class RatingResponse(BaseModel):
     movie_id: int
     movie_title: str = ""
     rating: float
+    comment: Optional[str] = None
+    timestamp: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MovieReviewResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    movie_id: int
+    rating: float
+    comment: str
     timestamp: Optional[datetime] = None
 
     class Config:

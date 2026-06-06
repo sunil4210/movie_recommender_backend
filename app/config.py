@@ -33,6 +33,28 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:*,http://127.0.
 # TMDB
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
+# Email / SMTP — used for OTP delivery (signup verification + password reset).
+# When SMTP_HOST is empty the email service falls back to logging the OTP to
+# stdout, so the backend stays usable in local dev without any external creds.
+#
+# Free providers tested with this config:
+#   - Brevo:   smtp-relay.brevo.com:587   (300/day free, no card)
+#   - Mailtrap (sandbox): sandbox.smtp.mailtrap.io:2525  (dev inbox)
+#   - Gmail:   smtp.gmail.com:587         (use an app password, ~500/day)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "noreply@cinematch.local")
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "CineMatch")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
+# OTP policy
+OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "10"))
+OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
+OTP_CODE_LENGTH = int(os.getenv("OTP_CODE_LENGTH", "6"))
+
 # Dataset paths
 RATINGS_FILE = os.getenv("RATINGS_FILE", "./data/ml-100k/u.data")
 MOVIES_FILE = os.getenv("MOVIES_FILE", "./data/ml-100k/u.item")

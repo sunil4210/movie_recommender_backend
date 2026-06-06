@@ -1,16 +1,15 @@
+import logging
 import os
 import pickle
-import logging
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from surprise import Dataset, Reader, SVD, KNNBasic
 from surprise.model_selection import cross_validate
-from surprise.accuracy import rmse as surprise_rmse
 from sqlalchemy.orm import Session
 
-from app.config import MODEL_PATH, RATINGS_FILE, DEFAULT_RECOMMENDATION_COUNT
+from app.config import MODEL_PATH, DEFAULT_RECOMMENDATION_COUNT
 from app.database import SessionLocal, Rating, Movie
 
 logger = logging.getLogger(__name__)
@@ -233,30 +232,56 @@ class RecommenderEngine:
             self.train_model()
             model = self._get_model(algorithm)
 
+        # Always read the user's rated movies FROM THE DATABASE (not the cached
+        # ratings_df, which is only refreshed every RETRAIN_THRESHOLD ratings).
+        # Otherwise newly-registered users + their onboarding ratings are invisible
+        # here and the user sees their own picks recommended back to them.
+        rated_movies: set = set()
+        user_rated_pairs: list = []  # (movie_id, rating) for fallback strategies
+        close_db = False
+        if db is None:
+            db = SessionLocal()
+            close_db = True
+        try:
+            db_ratings = (
+                db.query(Rating.movie_id, Rating.rating)
+                .filter(Rating.user_id == user_id)
+                .all()
+            )
+            for mid, score in db_ratings:
+                rated_movies.add(int(mid))
+                user_rated_pairs.append((int(mid), float(score)))
+        finally:
+            if close_db:
+                db.close()
+                db = None
+
+        # Pull up to 3 top-rated titles for the "reason" string.
+        user_rated_titles: list = []
+        if user_rated_pairs and self.movies_df is not None:
+            top_three = sorted(user_rated_pairs, key=lambda p: p[1], reverse=True)[:3]
+            for mid, _ in top_three:
+                row = self.movies_df[self.movies_df["movie_id"] == mid]
+                if not row.empty:
+                    user_rated_titles.append(row.iloc[0]["title"])
+
         if model is None:
             # Models still unavailable (e.g., no ratings yet) → fall back to popular.
-            return self._get_popular_movies(n, db)
-
-        # Build the set of movies the user has already rated — we never re-recommend these.
-        # Also grab their 3 top-rated titles to personalize the "reason" string.
-        rated_movies = set()
-        user_rated_titles = []
-        if self.ratings_df is not None:
-            user_ratings = self.ratings_df[self.ratings_df["user_id"] == user_id]
-            rated_movies = set(user_ratings["movie_id"].tolist())
-            if not user_ratings.empty:
-                top_rated = user_ratings.nlargest(3, "rating")
-                if self.movies_df is not None:
-                    for mid in top_rated["movie_id"]:
-                        row = self.movies_df[self.movies_df["movie_id"] == mid]
-                        if not row.empty:
-                            user_rated_titles.append(row.iloc[0]["title"])
+            return self._get_popular_movies(n, db, exclude=rated_movies)
 
         # 2. Cold start: user not in trainset → no neighbors → can't run CF.
+        #    Try item-based recs from their existing ratings before falling back to
+        #    popular. This is what makes a brand-new user's recommendations actually
+        #    reflect the 5 movies they picked during onboarding.
         try:
             self.trainset.to_inner_uid(user_id)
         except ValueError:
-            return self._get_popular_movies(n, db)
+            item_based = self._item_based_recs_for_unseen_user(
+                user_rated_pairs, rated_movies, n
+            )
+            if item_based:
+                return item_based
+            return self._get_popular_movies(n, db, exclude=rated_movies)
 
         if self.movies_df is None:
             self.load_data()
@@ -518,20 +543,31 @@ class RecommenderEngine:
             self.train_model(force=True)
             self._new_ratings_count = 0
 
-    def _get_popular_movies(self, n: int, db: Optional[Session] = None) -> List[dict]:
+    def _get_popular_movies(
+        self,
+        n: int,
+        db: Optional[Session] = None,
+        exclude: Optional[set] = None,
+    ) -> List[dict]:
         """Cold-start fallback: most-popular movies with a minimum rating count.
 
         Used when a user has no ratings yet (so CF has no signal). Movies are
         required to have ≥20 ratings to filter out obscure entries, then sorted by
         average rating descending.
+
+        `exclude` (set of movie_ids) is skipped so a new user who already picked
+        5 movies during onboarding doesn't see them recommended back.
         """
         close_db = False
         if db is None:
             db = SessionLocal()
             close_db = True
+        exclude = exclude or set()
 
         try:
             from sqlalchemy import func
+            # Pull extra so we still have ≥n after excluding the user's picks.
+            limit = n + max(len(exclude), 20)
             popular = (
                 db.query(
                     Rating.movie_id,
@@ -541,12 +577,14 @@ class RecommenderEngine:
                 .group_by(Rating.movie_id)
                 .having(func.count(Rating.id) >= 20)
                 .order_by(func.avg(Rating.rating).desc())
-                .limit(n)
+                .limit(limit)
                 .all()
             )
 
             results = []
             for movie_id, avg_rating, count in popular:
+                if int(movie_id) in exclude:
+                    continue
                 movie = db.query(Movie).filter(Movie.id == movie_id).first()
                 if movie:
                     results.append({
@@ -558,11 +596,98 @@ class RecommenderEngine:
                         "blur_hash": movie.blur_hash,
                         "reason": f"Trending — loved by {count} users"
                     })
+                if len(results) >= n:
+                    break
 
             return results
         finally:
             if close_db:
                 db.close()
+
+    def _item_based_recs_for_unseen_user(
+        self,
+        user_rated_pairs: List[Tuple[int, float]],
+        rated_movies: set,
+        n: int,
+    ) -> List[dict]:
+        """Recommendations for a user not yet in the trainset.
+
+        Strategy: take every movie the user rated ≥3.5★, find each one's nearest
+        neighbours in SVD's learned item-factor matrix (cosine on `model.qi`),
+        sum the similarities weighted by the user's rating, then return the top-N
+        unrated movies.
+
+        This is the only path that lets a freshly-registered user get personalised
+        recs immediately — without it they fall straight to popular movies.
+        """
+        if (self.model is None or self.trainset is None
+                or self.movies_df is None or not user_rated_pairs):
+            return []
+
+        liked = [(mid, score) for mid, score in user_rated_pairs if score >= 3.5]
+        if not liked:
+            return []
+
+        item_factors = self.model.qi  # (n_items, n_factors)
+        norms = np.linalg.norm(item_factors, axis=1)
+        norms = np.where(norms == 0, 1e-9, norms)
+
+        scores: dict = {}
+        for source_mid, source_score in liked:
+            try:
+                src_inner = self.trainset.to_inner_iid(source_mid)
+            except ValueError:
+                continue
+            src_vec = item_factors[src_inner]
+            src_norm = norms[src_inner]
+            # cosine sim of source vs every other movie
+            sims = (item_factors @ src_vec) / (norms * src_norm)
+            weight = source_score / 5.0
+            for inner_id, sim in enumerate(sims):
+                if inner_id == src_inner:
+                    continue
+                try:
+                    raw_id = int(self.trainset.to_raw_iid(inner_id))
+                except ValueError:
+                    continue
+                if raw_id in rated_movies:
+                    continue
+                scores[raw_id] = scores.get(raw_id, 0.0) + float(sim) * weight
+
+        if not scores:
+            return []
+
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+        # Title of the user's top-rated movie powers the "reason" string.
+        top_liked = max(user_rated_pairs, key=lambda p: p[1])
+        top_title = ""
+        row = self.movies_df[self.movies_df["movie_id"] == top_liked[0]]
+        if not row.empty:
+            top_title = row.iloc[0]["title"]
+
+        results: List[dict] = []
+        for mid, score in ranked:
+            row = self.movies_df[self.movies_df["movie_id"] == mid]
+            if row.empty:
+                continue
+            r = row.iloc[0]
+            results.append({
+                "movie_id": int(mid),
+                "title": r["title"],
+                "genres": (r["genres"] or "unknown").split("|"),
+                "predicted_rating": round(min(5.0, max(1.0, 2.5 + score)), 2),
+                "poster_url": self._get_poster_url(int(mid)),
+                "blur_hash": self._get_blur_hash(int(mid)),
+                "reason": (
+                    f"Because you liked {top_title}" if top_title
+                    else "Based on the movies you picked"
+                ),
+            })
+            if len(results) >= n * 2:
+                break
+
+        return self._diversify_recommendations(results, n)[:n]
 
     def _diversify_recommendations(self, predictions: List[dict], n: int) -> List[dict]:
         """Cap the number of times any single genre can appear in the top-N.

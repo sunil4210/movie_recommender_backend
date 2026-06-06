@@ -55,25 +55,25 @@ def submit_feedback(
         db.commit()
         db.refresh(feedback)
 
-    # Also create/update a rating to feed into CF model
-    implicit_rating = 5.0 if data.feedback_type == "thumbs_up" else 1.0
+    # Also feed an implicit rating into the CF model so thumbs gestures still
+    # influence recommendations. Crucially, NEVER overwrite a row the user
+    # already rated explicitly — their 3.5★ is more accurate than a binary
+    # thumbs-up snap to 5.0, and silently clobbering it ruins their history.
     existing_rating = (
         db.query(Rating)
         .filter(Rating.user_id == data.user_id, Rating.movie_id == data.movie_id)
         .first()
     )
-    if existing_rating:
-        existing_rating.rating = implicit_rating
-        existing_rating.timestamp = datetime.utcnow()
-    else:
+    if existing_rating is None:
+        implicit_rating = 5.0 if data.feedback_type == "thumbs_up" else 1.0
         db.add(Rating(
             user_id=data.user_id,
             movie_id=data.movie_id,
             rating=implicit_rating,
             timestamp=datetime.utcnow(),
         ))
-    db.commit()
-    recommender.record_new_rating()
+        db.commit()
+        recommender.record_new_rating()
 
     return FeedbackResponse(
         id=feedback.id,
@@ -90,9 +90,9 @@ def get_user_feedback(
     current_user: User = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
+    """Get all feedback submitted by a user."""
     if current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Cannot view other user's feedback")
-    """Get all feedback submitted by a user."""
     feedbacks = db.query(Feedback).filter(Feedback.user_id == user_id).all()
     return [
         FeedbackResponse(
